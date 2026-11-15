@@ -1,0 +1,213 @@
+{
+  "ms": {
+    "id": "ms",
+    "name": "ModelScope 魔搭",
+    "label": "ModelScope 魔搭  (免费 2000 次/天)",
+    "baseUrl": "https://api-inference.modelscope.cn",
+    "modelsEndpoint": "https://api-inference.modelscope.cn/v1/models",
+    "default": "Qwen/Qwen3.5-35B-A3B",
+    "keyHint": "https://modelscope.cn/my/myaccesstoken",
+    "known": [
+      "Qwen/Qwen3.5-35B-A3B",
+      "Qwen/Qwen3.8-27B",
+      "Qwen/Qwen3.5-122B-A10B",
+      "Qwen/Qwen3.5-397B-A17B",
+      "Qwen/Qwen3.8-Flash-Next",
+      "ZhipuAI/GLM-4.7-Flash",
+      "ZhipuAI/GLM-5.2",
+      "deepseek-ai/DeepSeek-V4.1-Flash"
+    ],
+    "notes": {
+      "Qwen/Qwen3.5-35B-A3B": "省魔粒·35B(A3B)·日常首选",
+      "Qwen/Qwen3.8-27B": "省魔粒·27B·新",
+      "Qwen/Qwen3.5-122B-A10B": "主力·122B·均衡",
+      "Qwen/Qwen3.5-397B-A17B": "旗舰·最强·偏贵",
+      "Qwen/Qwen3.8-Flash-Next": "180B·能看图·偏贵",
+      "ZhipuAI/GLM-4.7-Flash": "免费·Agentic Coding",
+      "ZhipuAI/GLM-5.2": "通用·新",
+      "deepseek-ai/DeepSeek-V4.1-Flash": "主力·均衡通用"
+    },
+    "endpoints": {
+      "openai": "https://api-inference.modelscope.cn/v1"
+    }
+  },
+  "ds": {
+    "id": "ds",
+    "name": "DeepSeek 官方",
+    "label": "DeepSeek 官方  (便宜、稳定)",
+    "baseUrl": "https://api.deepseek.com/anthropic",
+    "modelsEndpoint": "https://api.deepseek.com/v1/models",
+    "default": "deepseek-chat",
+    "keyHint": "https://platform.deepseek.com/api_keys",
+    "known": [
+      "deepseek-chat",
+      "deepseek-reasoner",
+      "deepseek-v4-pro"
+    ],
+    "notes": {
+      "deepseek-chat": "主力·均衡通用",
+      "deepseek-reasoner": "深度推理·慢",
+      "deepseek-v4-pro": "旗舰·能力最强·吃 token"
+    },
+    "endpoints": {
+      "openai": "https://api.deepseek.com/v1"
+    }
+  },
+  "glm": {
+    "id": "glm",
+    "name": "智谱 GLM",
+    "label": "智谱 GLM  (新户送 2000 万 tokens·400K 窗口)",
+    "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+    "modelsEndpoint": "https://open.bigmodel.cn/api/paas/v4/models",
+    "default": "glm-4.7-flash",
+    "keyHint": "https://open.bigmodel.cn/usercenter/apikeys",
+    "known": [
+      "glm-4.7-flash",
+      "glm-5.3-flash",
+      "glm-5.3-flashx",
+      "glm-5.3",
+      "glm-4.6",
+      "glm-4.5-air"
+    ],
+    "notes": {
+      "glm-4.7-flash": "永久免费·Agentic Coding",
+      "glm-5.3-flash": "赠 1500 万tokens·400K·能看图",
+      "glm-5.3-flashx": "赠 300 万tokens·200t/s·快",
+      "glm-5.3": "旗舰·最强·走通用包",
+      "glm-4.6": "上一代·通用",
+      "glm-4.5-air": "轻量·很便宜"
+    },
+    "endpoints": {
+      "openai": "https://open.bigmodel.cn/api/paas/v4"
+    }
+  },
+  "kimi": {
+    "id": "kimi",
+    "name": "月之暗面 Kimi",
+    "label": "月之暗面 Kimi  (代码口碑好)",
+    "baseUrl": "https://api.moonshot.cn/anthropic",
+    "modelsEndpoint": "https://api.moonshot.cn/v1/models",
+    "default": "kimi-k2-turbo-preview",
+    "keyHint": "https://platform.moonshot.cn/console/api-keys",
+    "known": [
+      "kimi-k2-turbo-preview",
+      "kimi-k2-thinking",
+      "kimi-k2-0905-preview"
+    ],
+    "notes": {
+      "kimi-k2-turbo-preview": "主力·代码口碑好",
+      "kimi-k2-thinking": "深度推理",
+      "kimi-k2-0905-preview": "预览版"
+    },
+    "endpoints": {
+      "openai": "https://api.moonshot.cn/v1"
+    }
+  },
+  "sf": {
+    "id": "sf",
+    "name": "硅基流动 SiliconFlow",
+    "label": "硅基流动  (60+ 个模型可选)",
+    "baseUrl": "https://api.siliconflow.cn",
+    "modelsEndpoint": "https://api.siliconflow.cn/v1/models",
+    "default": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "keyHint": "https://cloud.siliconflow.cn/account/ak",
+    "known": [
+      "deepseek-ai/DeepSeek-V4.1-Flash",
+      "deepseek-ai/DeepSeek-V4-Pro",
+      "Qwen/Qwen3.5-35B-A3B",
+      "Qwen/Qwen3.5-122B-A10B",
+      "zai-org/GLM-5.3",
+      "moonshotai/Kimi-K2.7-Code"
+    ],
+    "notes": {
+      "deepseek-ai/DeepSeek-V4.1-Flash": "主力·均衡通用·写代码首选",
+      "deepseek-ai/DeepSeek-V4-Pro": "旗舰·能力最强·吃 token",
+      "Qwen/Qwen3.5-35B-A3B": "省魔粒·35B(A3B)·日常首选",
+      "Qwen/Qwen3.5-122B-A10B": "主力·122B·均衡",
+      "zai-org/GLM-5.3": "旗舰·前端审美好",
+      "moonshotai/Kimi-K2.7-Code": "纯代码模型"
+    },
+    "endpoints": {
+      "openai": "https://api.siliconflow.cn/v1"
+    }
+  },
+  "bl": {
+    "id": "bl",
+    "name": "阿里云百炼",
+    "label": "阿里云百炼  (新用户送大额免费 token)",
+    "baseUrl": "https://dashscope.aliyuncs.com/apps/anthropic",
+    "modelsEndpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+    "default": "qwen3-coder-plus",
+    "keyHint": "https://bailian.console.aliyun.com/",
+    "known": [
+      "qwen3-coder-plus",
+      "qwen3.5-plus",
+      "qwen-max",
+      "qwen-flash"
+    ],
+    "notes": {
+      "qwen3-coder-plus": "百炼·代码主力",
+      "qwen3.5-plus": "百炼·通用旗舰",
+      "qwen-max": "百炼·旗舰",
+      "qwen-flash": "百炼·快·省"
+    },
+    "endpoints": {
+      "openai": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    }
+  },
+  "ol": {
+    "id": "ol",
+    "name": "Ollama (云端免费 + 本地)",
+    "label": "Ollama  云端 7 款免费 + 本地无限量",
+    "baseUrl": "https://ollama.com",
+    "localBaseUrl": "http://localhost:11434",
+    "modelsEndpoint": "",
+    "default": "gpt-oss:120b",
+    "keyHint": "https://ollama.com/settings/keys",
+    "known": [
+      "gpt-oss:120b",
+      "gemma4:31b",
+      "gpt-oss:20b",
+      "nemotron-3-ultra",
+      "nemotron-3-super",
+      "nemotron-3-nano:30b",
+      "beam",
+      "qwen3.5:4b",
+      "qwen2.5:7b",
+      "gemma4:12b",
+      "qwen3.8:27b"
+    ],
+    "cloudModels": [
+      "gpt-oss:120b",
+      "gemma4:31b",
+      "gpt-oss:20b",
+      "nemotron-3-ultra",
+      "nemotron-3-super",
+      "nemotron-3-nano:30b",
+      "beam"
+    ],
+    "localModels": [
+      "qwen3.5:4b",
+      "qwen2.5:7b",
+      "gemma4:12b",
+      "qwen3.8:27b"
+    ],
+    "notes": {
+      "gpt-oss:120b": "O云·写代码快·无视觉·128K",
+      "gemma4:31b": "O云·唯一能看图·中文干净",
+      "gpt-oss:20b": "O云·思考型·无视觉",
+      "nemotron-3-ultra": "O云·英伟达·无视觉·最贵",
+      "nemotron-3-super": "O云·英伟达·无视觉·省钱",
+      "nemotron-3-nano:30b": "O云·英伟达·无视觉·小",
+      "beam": "O云·思考型·慢·无视觉",
+      "qwen3.5:4b": "本地·已下载·无限量",
+      "qwen2.5:7b": "本地·中·无限量",
+      "gemma4:12b": "本地·12B·需下 8GB",
+      "qwen3.8:27b": "本地·27B·需下 17GB"
+    },
+    "endpoints": {
+      "openai": "http://localhost:11434/v1",
+      "cloudOpenai": "https://ollama.com/v1"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "apipick",
+  "version": "1.0.0",
+  "description": "一个 api 命令管理 AI CLI 的 API 渠道与模型：为 Claude Code / Qwen Code / Codex / Gemini / Aider / OpenCode 注入渠道，支持自定义渠道与模型自动探测；可选 serve 模式做 Anthropic / OpenAI Responses / OpenAI Chat / Gemini 四协议互转。",
+  "type": "module",
+  "bin": {
+    "api": "bin/api.mjs",
+    "apipick": "bin/apipick.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "api.cmd",
+    "apipick.cmd",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/api.mjs",
+    "test": "node test/run.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "codex-cli",
+    "gemini-cli",
+    "qwen-code",
+    "opencode",
+    "aider",
+    "anthropic",
+    "openai",
+    "deepseek",
+    "glm",
+    "kimi",
+    "ollama",
+    "siliconflow",
+    "api-gateway",
+    "proxy",
+    "protocol-translation",
+    "cli"
+  ],
+  "license": "MIT"
+}
