@@ -18,7 +18,7 @@ import {
 import { collectUsage, filteredByDays, topN, totalTokens, hasUsageCache } from "../src/usage.mjs";
 import { renderStats, renderShow, renderPing, renderDash } from "../src/render.mjs";
 import { buildHtmlReport } from "../src/report.mjs";
-import { startServer } from "../src/serve/index.mjs";
+import { startServer, isExposed } from "../src/serve/index.mjs";
 import { ensurePricingTemplate, estimateTotal, loadPrices, fmtMoney } from "../src/pricing.mjs";
 import { fmtNum } from "../src/viz.mjs";
 import { banner, c, pad, width, ask, askHidden, info, ok, warn, err } from "../src/ui.mjs";
@@ -64,7 +64,10 @@ function help() {
   line("api serve --provider ds", "固定一个渠道，模型名照旧写");
   line("api serve --provider ds --wire openai", "指定出站协议：anthropic / openai / responses / gemini");
   line("api serve --port 8788 --log", "换端口，并打印每次请求的渠道/模型/耗时/tokens");
-  line("api serve --model-prefix", "首尾开前缀路由：claude 里 /model ds/deepseek-chat 直接换渠道");
+  line("api serve --host 0.0.0.0 --token <口令>", "给同网段其他机器用；不设 token 会拒绝启动");
+  line("api serve --max-body 2 --max-conn 8", "请求体上限（MiB，默认 8）、并发上限（默认 32）");
+  line("api serve --timeout 60", "上游多少秒没动静就断开（默认 300）");
+  line("api serve --no-prefix", "关掉模型名前缀路由（默认开：/model ds/deepseek-chat 直接换渠道）");
   line("", "入站支持 /v1/messages、/v1/chat/completions、/v1/responses、/v1beta/models/*");
 
   head("常用参数");
@@ -466,12 +469,23 @@ async function cmdServe(head) {
   const token = flagValue(head, "--token") || "";
   const log = head.includes("--log") || head.includes("-v");
 
+  const num = (flag, dflt) => {
+    const raw = flagValue(head, flag);
+    if (!raw) return dflt;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+  };
+  const maxBody = num("--max-body", 8) * 1024 * 1024;
+  const maxConcurrent = Math.floor(num("--max-conn", 32));
+  const timeout = num("--timeout", 300) * 1000;
+  const allowUnauthenticated = head.includes("--allow-unauthenticated");
+
   let info;
   try {
     info = await startServer({
       port, host, provider, wire, log,
       prefix: !head.includes("--no-prefix"),
-      token,
+      token, maxBody, maxConcurrent, timeout, allowUnauthenticated,
     });
   } catch (e) {
     if (e.code === "EADDRINUSE") err(`[!] 端口 ${port} 被占用，换一个：--port ${port + 1}`);
@@ -479,15 +493,28 @@ async function cmdServe(head) {
     return 1;
   }
 
-  const shown = host === "0.0.0.0" ? "127.0.0.1" : host;
+  const exposed = isExposed(host);
+  const wildcard = host === "0.0.0.0" || host === "::" || host === "";
+  // 0.0.0.0 是监听地址，不能当客户端地址用；本机访问一律走 127.0.0.1
+  const shown = wildcard ? "127.0.0.1" : host;
   const base = `http://${shown}:${port}`;
+  const authLine = info.state.token
+    ? c.green("已启用（Authorization: Bearer / x-api-key）")
+    : c.yellow("未设 token，仅本机可用");
   console.log("");
   console.log(c.cyan("  apipick serve") + c.gray("   本地协议转换网关（Ctrl+C 停止）"));
   console.log("");
-  console.log(`   ${c.gray("地址")}   ${c.white(base)}`);
+  console.log(`   ${c.gray("地址")}   ${c.white(base)}${exposed ? c.red("   监听对外地址") : ""}`);
+  if (exposed && wildcard) console.log(`   ${c.gray("外部访问")} ${c.gray(`http://<本机局域网 IP>:${port}`)}`);
+  console.log(`   ${c.gray("认证")}   ${authLine}`);
+  console.log(`   ${c.gray("限制")}   ${c.gray(`请求体 ${Math.round(maxBody / 1024 / 1024)} MiB · 并发 ${maxConcurrent} · 上游空闲 ${timeout / 1000}s`)}`);
   console.log(`   ${c.gray("渠道")}   ${info.state.provider ? c.yellow(info.state.provider.id) : c.gray("自动（模型名前缀优先，否则上次用的渠道）")}`);
   console.log(`   ${c.gray("出站")}   ${info.state.wire ? c.yellow(info.state.wire) : c.gray("按渠道自动挑")}`);
   console.log("");
+  if (exposed && !info.state.token) {
+    console.log(c.red("   警告：未设 token 且监听对外地址，同网段任何人都能调用，并消耗渠道额度。"));
+    console.log("");
+  }
   console.log(c.gray("   入站端点（说什么协议都能接）"));
   console.log(`     ${c.white(pad("POST /v1/messages", 44))}${c.gray("Anthropic Messages · Claude Code")}`);
   console.log(`     ${c.white(pad("POST /v1/chat/completions", 44))}${c.gray("OpenAI Chat")}`);
@@ -495,11 +522,12 @@ async function cmdServe(head) {
   console.log(`     ${c.white(pad("POST /v1beta/models/<m>:generateContent", 44))}${c.gray("Gemini")}`);
   console.log(`     ${c.white(pad("GET  /v1/models", 44))}${c.gray("聚合模型列表")}`);
   console.log("");
+  const shownToken = info.state.token || "local";
   console.log(c.gray("   接到 Claude Code 上："));
-  console.log(`     ${c.white(`ANTHROPIC_BASE_URL=${base} ANTHROPIC_AUTH_TOKEN=local claude`)}`);
+  console.log(`     ${c.white(`ANTHROPIC_BASE_URL=${base} ANTHROPIC_AUTH_TOKEN=${shownToken} claude`)}`);
   console.log("");
   console.log(c.gray("   接上任何 OpenAI 协议客户端："));
-  console.log(`     ${c.white(`OPENAI_BASE_URL=${base}/v1 OPENAI_API_KEY=local`)}`);
+  console.log(`     ${c.white(`OPENAI_BASE_URL=${base}/v1 OPENAI_API_KEY=${shownToken}`)}`);
   console.log("");
 
   const stop = () => {

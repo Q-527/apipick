@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "start": "node bin/api.mjs",
-    "test": "node test/run.mjs"
+    "test": "node test/run.mjs && node test/serve.mjs"
   },
   "engines": {
     "node": ">=18"

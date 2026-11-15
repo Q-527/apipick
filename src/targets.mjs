@@ -105,7 +105,8 @@ export function codexConfigPath(providerId) {
 }
 
 export function opencodeConfigPath() {
-  return join(homedir(), ".config", "opencode", "opencode.json");
+  // opencode 自身认 OPENCODE_CONFIG，跟随它，别写到另一个地方
+  return process.env.OPENCODE_CONFIG || join(homedir(), ".config", "opencode", "opencode.json");
 }
 
 function buildCodexConfig(x) {
@@ -141,7 +142,18 @@ function buildOpencodeConfig(x) {
   const file = opencodeConfigPath();
   let cfg = {};
   if (existsSync(file)) {
-    try { cfg = JSON.parse(readFileSync(file, "utf8")) || {}; } catch { cfg = {}; }
+    const raw = readFileSync(file, "utf8");
+    if (raw.trim()) {
+      // 读不懂就停手：宁可这次不启动，也不能把别人原有的配置冲掉
+      try {
+        cfg = JSON.parse(raw);
+      } catch (e) {
+        throw new Error(`${file} 不是合法 JSON（${e.message}），已取消写入，原文件未改动`);
+      }
+      if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) {
+        throw new Error(`${file} 顶层不是 JSON 对象，已取消写入，原文件未改动`);
+      }
+    }
   }
   if (!cfg.$schema) cfg.$schema = "https://opencode.ai/config.json";
   if (!cfg.provider || typeof cfg.provider !== "object") cfg.provider = {};

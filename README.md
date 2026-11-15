@@ -119,7 +119,7 @@ api serve                          # 127.0.0.1:8787，渠道按模型名前缀�
 api serve -p ds                    # 固定 ds 渠道，模型名照常书写
 api serve -p ds --wire openai      # 强制出站协议
 api serve --port 8788 --log        # 更换端口并打印每次请求
-api serve --host 0.0.0.0 --token <口令>   # 供局域网使用，带 token 校验
+api serve --host 0.0.0.0 --token <口令>   # 供局域网使用，必须带 token
 ```
 
 启动后输出：
@@ -128,9 +128,27 @@ api serve --host 0.0.0.0 --token <口令>   # 供局域网使用，带 token 校
   apipick serve   本地协议转换网关（Ctrl+C 停止）
 
    地址   http://127.0.0.1:8787
+   认证   未设 token，仅本机可用
+   限制   请求体 8 MiB · 并发 32 · 上游空闲 300s
    渠道   自动（模型名前缀优先，否则上次使用的渠道）
    出站   按渠道自动选择
 ```
+
+### 对外监听
+
+`--host` 指向非回环地址（`0.0.0.0`、`::`、局域网 IP）时，服务必须带 `--token` 才能启动，否则直接报错退出。理由是这种监听对同网段的所有设备开放，任何人都能调用上游渠道并消耗额度。
+
+确实不需要认证时加 `--allow-unauthenticated` 显式放行，启动横幅会打印警告。
+
+### 资源上限
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--max-body` | 8 MiB | 单个请求体上限，超出返回 413 |
+| `--max-conn` | 32 | 同时在处理的请求数，超出返回 429 |
+| `--timeout` | 300 秒 | 上游多久没有数据就中断；流式响应每次收到数据重新计时 |
+
+客户端断开连接时，发往上游的请求会一并取消，不会继续消耗额度。
 
 ### 接入 Claude Code
 
@@ -209,7 +227,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
 ## 开发
 
 ```bash
+npm test              # 两组共 31 个用例
 node test/run.mjs     # 18 个离线用例：解析 / 构造 / 4×4 往返 / 事件编码
+node test/serve.mjs   # 13 个服务层用例：认证 / 体积上限 / 并发 / 超时 / 流式失败 / 配置保护
 node bin/api.mjs --help
 ```
 

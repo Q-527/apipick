@@ -77,6 +77,16 @@ api serve --port 8788 --log      # verbose request log
 api serve --host 0.0.0.0 --token <secret>
 ```
 
+When `--host` points at a non-loopback address (`0.0.0.0`, `::`, a LAN IP), a `--token` is required or the process exits. Such a listener is reachable from every device on the network, and each request spends the channel's quota. `--allow-unauthenticated` exists for the case where the network boundary is handled elsewhere; the startup banner then prints a warning.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--max-body` | 8 MiB | Request body cap, returns 413 |
+| `--max-conn` | 32 | Concurrent requests, returns 429 |
+| `--timeout` | 300 s | Abort when the upstream sends nothing for this long; reset on every streaming chunk |
+
+Disconnecting the client cancels the upstream request, so an abandoned stream stops spending quota.
+
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
 ```
@@ -112,7 +122,9 @@ Built-in channels: `ms` ModelScope, `ds` DeepSeek, `glm` Zhipu, `kimi` Moonshot,
 ## Dev
 
 ```bash
+npm test             # 31 cases in two suites
 node test/run.mjs    # 18 offline cases: parse / build / 4×4 round-trip / event encoding
+node test/serve.mjs  # 13 server cases: auth / body limit / concurrency / timeout / stream errors / config guard
 ```
 
 MIT License.

@@ -10,6 +10,18 @@ import { roughTokens } from "./ir.mjs";
 import { c, pad } from "../ui.mjs";
 
 const DEFAULT_PORT = 8787;
+const DEFAULT_MAX_BODY = 8 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT = 32;
+const DEFAULT_TIMEOUT = 300_000;
+
+// 只有这些地址算「本机内部」，其余（0.0.0.0 / :: / 局域网 IP / 空）都会对外开放
+const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"]);
+
+export function isExposed(host) {
+  return !LOOPBACK.has(String(host || "").trim().toLowerCase());
+}
+
+export class PayloadTooLarge extends Error {}
 
 // ---------------- 渠道 / 协议选择 ----------------
 function looksAnthropic(base) {
@@ -67,12 +79,24 @@ function errorBody(inbound, status, message) {
   return { error: { message, type: "upstream_error", code: status } };
 }
 
-async function readBody(req, limit = 64 * 1024 * 1024) {
+// 流式响应已经把 200 发出去了，错误只能以事件形式送，格式得跟着入站协议走
+function streamErrorChunk(inbound, status, message) {
+  if (inbound === "anthropic") {
+    const type = status === 429 ? "rate_limit_error" : "api_error";
+    return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type, message } })}\n\n`;
+  }
+  if (inbound === "gemini") {
+    return `data: ${JSON.stringify({ error: { code: status, message, status: "INTERNAL" } })}\n\n`;
+  }
+  return `data: ${JSON.stringify({ error: { message, type: "upstream_error", code: status } })}\n\n`;
+}
+
+async function readBody(req, limit = DEFAULT_MAX_BODY) {
   const chunks = [];
   let size = 0;
   for await (const ch of req) {
     size += ch.length;
-    if (size > limit) throw new Error("请求体过大");
+    if (size > limit) throw new PayloadTooLarge(`请求体超过 ${Math.round(limit / 1024 / 1024)} MiB`);
     chunks.push(ch);
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -88,16 +112,29 @@ const sseHeaders = {
 // ---------------- server ----------------
 export function createServer(opts = {}) {
   const state = {
-    port: opts.port || DEFAULT_PORT,
+    port: opts.port ?? DEFAULT_PORT,
     host: opts.host || "127.0.0.1",
     provider: opts.provider ? resolveProvider(opts.provider) : null,
     wire: opts.wire || "",
     log: !!opts.log,
     prefix: opts.prefix !== false,
     token: opts.token || "",
+    maxBody: opts.maxBody || DEFAULT_MAX_BODY,
+    maxConcurrent: opts.maxConcurrent || DEFAULT_MAX_CONCURRENT,
+    timeout: opts.timeout || DEFAULT_TIMEOUT,
+    inflight: 0,
     counters: { req: 0, ok: 0, fail: 0, inTok: 0, outTok: 0 },
   };
   if (opts.provider && !state.provider) throw new Error(`未知渠道：${opts.provider}`);
+
+  // 监听对外地址却没有 token，等于把渠道额度交给整个网络
+  if (isExposed(state.host) && !state.token && !opts.allowUnauthenticated) {
+    throw new Error(
+      `拒绝在 ${state.host} 上无认证启动：该地址可被其他机器访问，任何人都能消耗渠道额度。\n`
+      + `  加认证        --token <口令>\n`
+      + `  确实不需要    --allow-unauthenticated`,
+    );
+  }
 
   const server = http.createServer((req, res) => {
     handle(req, res, state).catch((e) => {
@@ -148,6 +185,29 @@ async function handle(req, res, state) {
     }
   }
 
+  if (state.inflight >= state.maxConcurrent) {
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inboundOf(path, req.url), 429, `并发已满（上限 ${state.maxConcurrent}）`)));
+    return;
+  }
+  state.inflight += 1;
+  try {
+    await dispatch(req, res, state, path);
+  } finally {
+    state.inflight -= 1;
+  }
+}
+
+function inboundOf(path, rawUrl) {
+  const p = String(path || "");
+  if (/^\/(?:v1beta|v1)\/models\/.+:(generateContent|streamGenerateContent)$/.test(p)) return "gemini";
+  if (p === "/v1/messages" || p === "/messages") return "anthropic";
+  if (p === "/v1/chat/completions" || p === "/chat/completions") return "openai";
+  if (p === "/v1/responses" || p === "/responses") return "responses";
+  return "openai";
+}
+
+async function dispatch(req, res, state, path) {
   if (path === "/v1/models" || path === "/models") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ object: "list", data: listModels(state) }));
@@ -156,7 +216,7 @@ async function handle(req, res, state) {
 
   // 兼容 Claude Code 的 token 计数端点（它只用来估上下文，不要求精确）
   if (path === "/v1/messages/count_tokens") {
-    const raw = await readBody(req);
+    const raw = await readBody(req, state.maxBody);
     let body = {};
     try { body = JSON.parse(raw); } catch { /* ignore */ }
     const ir = parseRequest("anthropic", body);
@@ -192,13 +252,15 @@ async function handle(req, res, state) {
 
   let ir;
   try {
-    const raw = await readBody(req);
+    const raw = await readBody(req, state.maxBody);
     const body = JSON.parse(raw || "{}");
     ir = parseRequest(inbound, body, { model: modelFromPath });
   } catch (e) {
     state.counters.fail += 1;
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, 400, `请求体解析失败：${e.message}`)));
+    const status = e instanceof PayloadTooLarge ? 413 : 400;
+    const why = status === 413 ? e.message : `请求体解析失败：${e.message}`;
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inbound, status, why)));
     return;
   }
 
@@ -233,28 +295,56 @@ async function handle(req, res, state) {
   const outBody = buildRequest(wire, ir);
   const target = ir.stream ? streamUrl(wire, base, model) : outboundUrl(wire, base, model);
 
+  // 客户端断开、上游卡住，都要有人踩刹车，否则连接和内存会一直挂着
+  const ac = new AbortController();
+  let abortWhy = "";
+  const halt = (why) => {
+    if (ac.signal.aborted) return;
+    abortWhy = why;
+    ac.abort();
+  };
+  const budget = `上游 ${Math.round(state.timeout / 1000)} 秒无响应`;
+  let idleTimer = setTimeout(() => halt(budget), state.timeout);
+  idleTimer.unref?.();
+  const touch = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => halt(budget), state.timeout);
+    idleTimer.unref?.();
+  };
+  const stopClock = () => clearTimeout(idleTimer);
+  const onClientGone = () => { if (!res.writableEnded) halt("客户端已断开"); };
+  res.once("close", onClientGone);
+  const statusOf = () => (abortWhy === "客户端已断开" ? 499 : 502);
+
   let upstream;
   try {
     upstream = await fetch(target, {
       method: "POST",
       headers: upstreamHeaders(wire, key),
       body: JSON.stringify(outBody),
+      signal: ac.signal,
     });
   } catch (e) {
+    stopClock();
     state.counters.fail += 1;
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, 502, `连不上上游：${e.message}`)));
-    logLine(state, { inbound, provider, wire, model, status: 502, ms: Date.now() - started });
+    try {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify(errorBody(inbound, 502, `连不上上游：${abortWhy || e.message}`)));
+    } catch { /* client gone */ }
+    logLine(state, { inbound, provider, wire, model, status: statusOf(), ms: Date.now() - started });
     return;
   }
 
   if (!upstream.ok) {
+    stopClock();
     const text = await upstream.text().catch(() => "");
     let msg = text;
     try { const j = JSON.parse(text); msg = j.error?.message || j.error?.msg || j.message || text; } catch { /* keep raw */ }
     state.counters.fail += 1;
-    res.writeHead(upstream.status, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, upstream.status, String(msg).slice(0, 800))));
+    try {
+      res.writeHead(upstream.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(errorBody(inbound, upstream.status, String(msg).slice(0, 800))));
+    } catch { /* client gone */ }
     logLine(state, { inbound, provider, wire, model, status: upstream.status, ms: Date.now() - started });
     return;
   }
@@ -266,28 +356,35 @@ async function handle(req, res, state) {
     try {
       if (String(upstream.headers.get("content-type") || "").includes("event-stream")) {
         // 上游硬要流式：先聚合
-        for await (const ev of decodeStream(wire, upstream)) em.push(ev);
+        for await (const ev of decodeStream(wire, upstream)) {
+          touch();
+          if (ev.type === "error") throw new Error(ev.message || "上游返回错误事件");
+          em.push(ev);
+        }
         json = em.toJSON();
       } else {
         json = await upstream.json();
+        for (const ev of decodeJSON(wire, json)) em.push(ev);
+        json = em.toJSON();
       }
     } catch (e) {
+      stopClock();
       state.counters.fail += 1;
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify(errorBody(inbound, 502, `上游响应解析失败：${e.message}`)));
+      try {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify(errorBody(inbound, 502, `上游响应解析失败：${abortWhy || e.message}`)));
+      } catch { /* client gone */ }
+      logLine(state, { inbound, provider, wire, model, status: statusOf(), ms: Date.now() - started });
       return;
     }
-    if (String(upstream.headers.get("content-type") || "").includes("event-stream")) {
-      // 已聚合完毕
-    } else {
-      for (const ev of decodeJSON(wire, json)) em.push(ev);
-      json = em.toJSON();
-    }
+    stopClock();
     state.counters.ok += 1;
     state.counters.inTok += json?.usage?.input_tokens || json?.usage?.prompt_tokens || json?.usageMetadata?.promptTokenCount || 0;
     state.counters.outTok += json?.usage?.output_tokens || json?.usage?.completion_tokens || json?.usageMetadata?.candidatesTokenCount || 0;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(json));
+    try {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(json));
+    } catch { /* client gone */ }
     logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage: json?.usage || json?.usageMetadata });
     return;
   }
@@ -295,21 +392,32 @@ async function handle(req, res, state) {
   // ---- 流式 ----
   res.writeHead(200, sseHeaders);
   let usage = null;
+  let finished = false;
   try {
     for await (const ev of decodeStream(wire, upstream)) {
+      touch();
       if (ev.type === "usage") usage = { input: ev.input, output: ev.output };
+      if (ev.type === "error") throw new Error(ev.message || "上游返回错误事件");
       const chunk = em.push(ev);
       if (chunk) res.write(chunk);
     }
     const tail = em.end();
     if (tail) res.write(tail);
+    finished = true;
   } catch (e) {
-    try { res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`); } catch { /* gone */ }
+    const why = abortWhy || e.message || String(e);
+    try { res.write(streamErrorChunk(inbound, statusOf(), why)); } catch { /* client gone */ }
   } finally {
+    stopClock();
     try { res.end(); } catch { /* gone */ }
-    state.counters.ok += 1;
-    if (usage) { state.counters.inTok += usage.input || 0; state.counters.outTok += usage.output || 0; }
-    logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage });
+    if (finished) {
+      state.counters.ok += 1;
+      if (usage) { state.counters.inTok += usage.input || 0; state.counters.outTok += usage.output || 0; }
+      logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage });
+    } else {
+      state.counters.fail += 1;
+      logLine(state, { inbound, provider, wire, model, status: statusOf(), ms: Date.now() - started, usage });
+    }
   }
 }
 
