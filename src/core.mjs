@@ -20,6 +20,7 @@ const keysPath = () => join(homeDir(), "keys.json");
 const statePath = () => join(homeDir(), "state.json");
 const customPath = () => join(homeDir(), "providers.json");
 const cachePath = () => join(homeDir(), "models.cache.json");
+const serveStatsPath = () => join(homeDir(), "serve-stats.json");
 
 // ---------- providers ----------
 function readJson(file, fallback) {
@@ -133,6 +134,150 @@ export function setTarget(id) {
   const s = loadState();
   s.target = id;
   saveState(s);
+}
+
+// ---------- project config ----------
+export function projectConfigPath(cwd = process.cwd()) {
+  return join(cwd, ".apipick.json");
+}
+
+export function loadProjectConfig(cwd = process.cwd()) {
+  const fp = projectConfigPath(cwd);
+  if (!existsSync(fp)) return null;
+  try {
+    const obj = JSON.parse(readFileSync(fp, "utf8"));
+    return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveProjectConfig(config, cwd = process.cwd()) {
+  const fp = projectConfigPath(cwd);
+  writeFileSync(fp, JSON.stringify({ ...(config || {}), updatedAt: new Date().toISOString() }, null, 2) + "\n");
+  return fp;
+}
+
+/** The nearest ancestor project config wins; global state remains the fallback. */
+export function resolveProjectConfig(cwd = process.cwd()) {
+  let cur = cwd;
+  while (true) {
+    const cfg = loadProjectConfig(cur);
+    if (cfg) return cfg;
+    const parent = dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+export function getProjectDefaults(cwd = process.cwd()) {
+  const cfg = resolveProjectConfig(cwd) || {};
+  return {
+    provider: cfg.provider || "",
+    model: cfg.model || "",
+    target: cfg.target || getTarget(),
+  };
+}
+
+// ---------- model capabilities ----------
+const DEFAULT_CAPABILITY = { tools: false, vision: false, stream: true, reasoning: false, context: 128000 };
+
+/**
+ * Conservative name-based hints only. Providers can override these in
+ * providers.json under modelCapabilities[modelId]. Unknown capabilities are
+ * not advertised as supported.
+ */
+export function getModelCapability(model, provider = null) {
+  const id = String(model || "");
+  const overrides = provider?.modelCapabilities || {};
+  const explicit = overrides[id];
+  if (explicit && typeof explicit === "object") {
+    return { ...DEFAULT_CAPABILITY, ...explicit, context: Number(explicit.context || DEFAULT_CAPABILITY.context) };
+  }
+  const name = id.toLowerCase();
+  const vision = /vision|\bvl\b|gemini|gpt-4o|gpt-4\.1|claude-3|claude-sonnet|pixtral/i.test(name);
+  const reasoning = /reason|think|\br[1-9]\b|^o[1-9]|gemini-2\.5/i.test(name);
+  const tools = /gpt|claude|qwen|deepseek|glm|kimi|gemini|command-r/i.test(name);
+  return {
+    tools,
+    vision,
+    stream: true,
+    reasoning,
+    context: ctxLimit(id, provider),
+  };
+}
+
+export function filterModelsByCapability(models = [], filters = {}, provider = null) {
+  const keys = Object.entries(filters).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (!keys.length) return models;
+  return models.filter((model) => {
+    const cap = getModelCapability(model, provider);
+    return keys.every(([key, value]) => {
+      if (["tools", "vision", "stream", "reasoning"].includes(key)) return Boolean(cap[key]) === Boolean(value);
+      if (key === "context") return Number(cap.context) >= Number(value);
+      return true;
+    });
+  });
+}
+
+// ---------- serve stats ----------
+export function loadServeStats() {
+  return readJson(serveStatsPath(), {
+    req: 0,
+    ok: 0,
+    fail: 0,
+    inTok: 0,
+    outTok: 0,
+    byProvider: {},
+    byModel: {},
+    lastUpdated: "",
+  });
+}
+
+export function saveServeStats(obj) {
+  ensureHome();
+  const next = {
+    req: Number(obj.req) || 0,
+    ok: Number(obj.ok) || 0,
+    fail: Number(obj.fail) || 0,
+    inTok: Number(obj.inTok) || 0,
+    outTok: Number(obj.outTok) || 0,
+    byProvider: obj.byProvider || {},
+    byModel: obj.byModel || {},
+    lastUpdated: new Date().toISOString(),
+  };
+  writeFileSync(serveStatsPath(), JSON.stringify(next, null, 2));
+  return next;
+}
+
+export function recordServeStats({ provider, model, wire, ok = false, status = 0, inputTokens = 0, outputTokens = 0, latency = 0 } = {}) {
+  const stats = loadServeStats();
+  stats.req = (Number(stats.req) || 0) + 1;
+  if (ok) stats.ok = (Number(stats.ok) || 0) + 1;
+  else stats.fail = (Number(stats.fail) || 0) + 1;
+  stats.inTok = (Number(stats.inTok) || 0) + Number(inputTokens || 0);
+  stats.outTok = (Number(stats.outTok) || 0) + Number(outputTokens || 0);
+  if (provider) {
+    const entry = stats.byProvider?.[provider] || { req: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, latency: 0 };
+    entry.req += 1;
+    if (ok) entry.ok += 1; else entry.fail += 1;
+    entry.inTok += Number(inputTokens || 0);
+    entry.outTok += Number(outputTokens || 0);
+    entry.latency = (entry.latency || 0) + Number(latency || 0);
+    stats.byProvider[provider] = entry;
+  }
+  if (model) {
+    const entry = stats.byModel?.[model] || { req: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, latency: 0 };
+    entry.req += 1;
+    if (ok) entry.ok += 1; else entry.fail += 1;
+    entry.inTok += Number(inputTokens || 0);
+    entry.outTok += Number(outputTokens || 0);
+    entry.latency = (entry.latency || 0) + Number(latency || 0);
+    stats.byModel[model] = entry;
+  }
+  if (wire) stats.wire = { ...(stats.wire || {}), [wire]: (stats.wire?.[wire] || 0) + 1 };
+  stats.lastUpdated = new Date().toISOString();
+  return saveServeStats(stats);
 }
 
 // ---------- model helpers ----------
