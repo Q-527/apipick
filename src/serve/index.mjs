@@ -1,358 +1,330 @@
-// index.mjs — `apipick serve`：本地网关，把入站协议翻译成渠道真正说的协议。
-import http from "node:http";
-import { resolveProvider, providerList, getKey, getLast, getCurrent, modelPool, isChatModel } from "../core.mjs";
-import { endpointFor } from "../targets.mjs";
-import { parseRequest } from "./parse.mjs";
-import { buildRequest, outboundUrl, streamUrl } from "./build.mjs";
-import { decodeStream, decodeJSON } from "./stream.mjs";
-import { createEmitter } from "./emit.mjs";
-import { roughTokens } from "./ir.mjs";
-import { c, pad } from "../ui.mjs";
+// run.mjs — 离线回归测试（不联网）：协议解析 / 构造 / 4×4 往返 / 事件编码。
+// 跑法：node test/run.mjs   或   npm test
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseRequest } from "../src/serve/parse.mjs";
+import { buildRequest } from "../src/serve/build.mjs";
+import { createEmitter } from "../src/serve/emit.mjs";
+import { decodeJSON } from "../src/serve/stream.mjs";
+import { outboundUrl, streamUrl } from "../src/serve/build.mjs";
+import { exportConfig, importConfig, loadServeStats, recordServeStats } from "../src/core.mjs";
 
-const DEFAULT_PORT = 8787;
-
-// ---------------- 渠道 / 协议选择 ----------------
-function looksAnthropic(base) {
-  return /anthropic|\/apps\/?$/i.test(String(base || ""));
-}
-
-export function pickWire(inbound, provider, forced) {
-  if (forced) return forced;
-  const declared = provider.protocols;
-  if (Array.isArray(declared) && declared.length) {
-    return declared.includes(inbound) ? inbound : declared[0];
+let pass = 0;
+let fail = 0;
+const t = (name, fn) => {
+  try {
+    fn();
+    pass += 1;
+    console.log(`  ok   ${name}`);
+  } catch (e) {
+    fail += 1;
+    console.log(`  FAIL ${name}`);
+    console.log(`       ${e.message}`);
   }
-  if (inbound === "anthropic" && looksAnthropic(provider.baseUrl)) return "anthropic";
-  if (provider.endpoints?.openai) return "openai";
-  if (provider.endpoints?.gemini) return "gemini";
-  if (provider.baseUrl) return "anthropic";
-  return inbound;
-}
-
-function splitModel(name) {
-  const i = String(name || "").indexOf("/");
-  if (i > 0) {
-    const p = resolveProvider(name.slice(0, i));
-    if (p) return { provider: p, model: name.slice(i + 1) };
-  }
-  return { provider: null, model: String(name || "") };
-}
-
-function defaultProvider() {
-  const last = getLast();
-  if (last) {
-    const p = resolveProvider(last);
-    if (p) return p;
-  }
-  const withKey = providerList().filter((p) => getKey(p.id));
-  if (withKey.length) return withKey[0];
-  return providerList()[0] || null;
-}
-
-function upstreamHeaders(wire, key) {
-  if (wire === "anthropic") {
-    return { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key };
-  }
-  if (wire === "gemini") {
-    return { "content-type": "application/json", "x-goog-api-key": key };
-  }
-  return { "content-type": "application/json", authorization: `Bearer ${key}` };
-}
-
-function errorBody(inbound, status, message) {
-  if (inbound === "anthropic") {
-    return { type: "error", error: { type: status === 429 ? "rate_limit_error" : "api_error", message } };
-  }
-  if (inbound === "gemini") return { error: { code: status, message, status: "ERROR" } };
-  return { error: { message, type: "upstream_error", code: status } };
-}
-
-async function readBody(req, limit = 64 * 1024 * 1024) {
-  const chunks = [];
-  let size = 0;
-  for await (const ch of req) {
-    size += ch.length;
-    if (size > limit) throw new Error("请求体过大");
-    chunks.push(ch);
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-const sseHeaders = {
-  "content-type": "text/event-stream; charset=utf-8",
-  "cache-control": "no-cache, no-transform",
-  connection: "keep-alive",
-  "x-accel-buffering": "no",
 };
 
-// ---------------- server ----------------
-export function createServer(opts = {}) {
-  const state = {
-    port: opts.port || DEFAULT_PORT,
-    host: opts.host || "127.0.0.1",
-    provider: opts.provider ? resolveProvider(opts.provider) : null,
-    wire: opts.wire || "",
-    log: !!opts.log,
-    prefix: opts.prefix !== false,
-    token: opts.token || "",
-    counters: { req: 0, ok: 0, fail: 0, inTok: 0, outTok: 0 },
-  };
-  if (opts.provider && !state.provider) throw new Error(`未知渠道：${opts.provider}`);
+const HOME = mkdtempSync(join(tmpdir(), "apipick-test-"));
+process.env.APIPICK_HOME = HOME;
 
-  const server = http.createServer((req, res) => {
-    handle(req, res, state).catch((e) => {
-      try {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: e.message || String(e) } }));
-      } catch { /* client gone */ }
-    });
+function cleanup() {
+  rmSync(HOME, { recursive: true, force: true });
+}
+
+// ---------------- config import/export ----------------
+try {
+  const bucket = exportConfig();
+  t("exportConfig: returns stable bundle", () => {
+    assert.equal(bucket.version, 1);
+    assert.ok(bucket.state && typeof bucket.state === "object");
   });
-
-  return { server, state };
+  t("recordServeStats: persistent counters update", () => {
+    const s0 = loadServeStats();
+    const r = recordServeStats({ provider: "ds", model: "deepseek-chat", wire: "openai", ok: true, status: 200, inputTokens: 10, outputTokens: 20, latency: 40 });
+    const s1 = loadServeStats();
+    assert.equal(r.req, s1.req);
+    assert.equal(s1.req, s0.req + 1);
+    assert.equal(s1.ok, s0.ok + 1);
+    assert.equal(s1.byProvider.ds.req, (s0.byProvider?.ds?.req || 0) + 1);
+  });
+  t("importConfig: can merge provider state safely", () => {
+    importConfig({ state: { target: "codex" }, providers: { demo: { id: "demo", name: "Demo", baseUrl: "https://example.com", custom: true } } });
+    const state = JSON.parse(readFileSync(join(HOME, "state.json"), "utf8"));
+    const providers = JSON.parse(readFileSync(join(HOME, "providers.json"), "utf8"));
+    assert.equal(state.target, "codex");
+    assert.ok(providers.demo && providers.demo.id === "demo");
+  });
+} finally {
+  cleanup();
 }
 
-async function handle(req, res, state) {
-  const url = new URL(req.url, "http://localhost");
-  const path = url.pathname.replace(/\/+$/, "") || "/";
+// ---------------- 入站解析 ----------------
+t("anthropic: 解析 system / 文本 / 工具结果", () => {
+  const ir = parseRequest("anthropic", {
+    model: "m1",
+    system: "你是助手",
+    max_tokens: 100,
+    temperature: 0.3,
+    tools: [{ name: "f", description: "d", input_schema: { type: "object", properties: { a: { type: "string" } } } }],
+    messages: [
+      { role: "user", content: "查天气" },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "f", input: { a: "x" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "晴" }] },
+    ],
+  });
+  assert.equal(ir.system, "你是助手");
+  assert.equal(ir.maxTokens, 100);
+  assert.equal(ir.tools.length, 1);
+  assert.equal(ir.tools[0].name, "f");
+  assert.equal(ir.messages.length, 3);
+  assert.equal(ir.messages[1].blocks[0].type, "tool_use");
+  assert.equal(ir.messages[1].blocks[0].input.a, "x");
+  assert.equal(ir.messages[2].blocks[0].type, "tool_result");
+  assert.equal(ir.messages[2].blocks[0].text, "晴");
+});
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "access-control-allow-origin": "*",
-      "access-control-allow-headers": "*",
-      "access-control-allow-methods": "GET,POST,OPTIONS",
-    });
-    res.end();
-    return;
-  }
+t("openai: system 提到顶层，tool 消息合成 tool_result", () => {
+  const ir = parseRequest("openai", {
+    model: "m2",
+    max_tokens: 50,
+    messages: [
+      { role: "system", content: "系统提示" },
+      { role: "user", content: "查天气" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: '{"a":"x"}' } }] },
+      { role: "tool", tool_call_id: "c1", content: "晴" },
+    ],
+  });
+  assert.equal(ir.system, "系统提示");
+  assert.equal(ir.messages.length, 3);
+  assert.equal(ir.messages[1].blocks[0].type, "tool_use");
+  assert.deepEqual(ir.messages[1].blocks[0].input, { a: "x" });
+  assert.equal(ir.messages[2].blocks[0].toolUseId, "c1");
+});
 
-  if (path === "/" || path === "/health") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      service: "apipick serve",
-      provider: state.provider ? state.provider.id : "auto (model prefix or last used)",
-      wire: state.wire || "auto",
-      requests: state.counters.req,
-    }));
-    return;
-  }
+t("responses: input 数组里的 function_call / output", () => {
+  const ir = parseRequest("responses", {
+    model: "m3",
+    instructions: "系统",
+    input: [
+      { role: "user", content: "查天气" },
+      { type: "function_call", call_id: "k1", name: "f", arguments: '{"a":"x"}' },
+      { type: "function_call_output", call_id: "k1", output: "晴" },
+    ],
+  });
+  assert.equal(ir.system, "系统");
+  assert.equal(ir.messages[0].blocks[0].text, "查天气");
+  assert.equal(ir.messages[1].blocks[0].type, "tool_use");
+  assert.equal(ir.messages[2].blocks[0].type, "tool_result");
+  assert.equal(ir.messages[2].blocks[0].toolUseId, "k1");
+});
 
-  // 只有显式 --token 时才校验；默认只监听 127.0.0.1，不给本机之外开门
-  if (state.token) {
-    const auth = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-    const got = auth || String(req.headers["x-api-key"] || "");
-    if (got !== state.token) {
-      res.writeHead(401, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "token 不对", type: "auth_error" } }));
-      return;
-    }
-  }
+t("gemini: contents / systemInstruction / functionCall", () => {
+  const ir = parseRequest("gemini", {
+    systemInstruction: { parts: [{ text: "系统" }] },
+    contents: [
+      { role: "user", parts: [{ text: "查天气" }] },
+      { role: "model", parts: [{ functionCall: { name: "f", args: { a: "x" } } }] },
+      { role: "user", parts: [{ functionResponse: { name: "f", response: { result: "晴" } } }] },
+    ],
+  }, { model: "gm" });
+  assert.equal(ir.system, "系统");
+  assert.equal(ir.model, "gm");
+  assert.equal(ir.messages[1].blocks[0].type, "tool_use");
+  assert.equal(ir.messages[2].blocks[0].text, "晴");
+});
 
-  if (path === "/v1/models" || path === "/models") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ object: "list", data: listModels(state) }));
-    return;
-  }
-
-  // 兼容 Claude Code 的 token 计数端点（它只用来估上下文，不要求精确）
-  if (path === "/v1/messages/count_tokens") {
-    const raw = await readBody(req);
-    let body = {};
-    try { body = JSON.parse(raw); } catch { /* ignore */ }
-    const ir = parseRequest("anthropic", body);
-    let chars = ir.system.length;
-    for (const m of ir.messages) for (const b of m.blocks) chars += (b.text || "").length + 8;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ input_tokens: roughTokens("x".repeat(chars)) || 1 }));
-    return;
-  }
-
-  // 模型名允许带 %2F（ms/Qwen/xxx 这种带斜杠的写法）
-  const gm = /^\/(?:v1beta|v1)\/models\/(.+):(generateContent|streamGenerateContent)$/.exec(path);
-  let inbound = "";
-  let modelFromPath = "";
-  if (gm) { inbound = "gemini"; modelFromPath = decodeURIComponent(gm[1]); }
-  else if (path === "/v1/messages" || path === "/messages") inbound = "anthropic";
-  else if (path === "/v1/chat/completions" || path === "/chat/completions") inbound = "openai";
-  else if (path === "/v1/responses" || path === "/responses") inbound = "responses";
-
-  if (!inbound) {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: `没有这个路径：${path}` } }));
-    return;
-  }
-  if (req.method !== "POST") {
-    res.writeHead(405, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "只接受 POST" } }));
-    return;
-  }
-
-  const started = Date.now();
-  state.counters.req += 1;
-
-  let ir;
-  try {
-    const raw = await readBody(req);
-    const body = JSON.parse(raw || "{}");
-    ir = parseRequest(inbound, body, { model: modelFromPath });
-  } catch (e) {
-    state.counters.fail += 1;
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, 400, `请求体解析失败：${e.message}`)));
-    return;
-  }
-
-  // Gemini 的流式由路径决定
-  if (inbound === "gemini") ir.stream = gm[2] === "streamGenerateContent" || !!ir.stream;
-
-  // ---- 选渠道 ----
-  let provider = state.provider;
-  let model = ir.model;
-  if (!provider && state.prefix) {
-    const s = splitModel(ir.model);
-    if (s.provider) { provider = s.provider; model = s.model; }
-  }
-  if (!provider) provider = defaultProvider();
-  if (!provider) {
-    res.writeHead(503, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, 503, "没有可用渠道，先跑 apipick add 加一个")));
-    return;
-  }
-  if (!model) model = getCurrent(provider.id) || (provider.known && provider.known[0]) || "";
-
-  const wire = pickWire(inbound, provider, state.wire);
-  const key = getKey(provider.id) || (provider.id === "ol" ? "ollama" : "");
-  const base = endpointFor(provider, wire, { local: provider.id === "ol" });
-  if (!base) {
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, 502, `渠道 ${provider.id} 没有 ${wire} 协议的端点，用 --wire 指定`)));
-    return;
-  }
-
-  ir.model = model;
-  const outBody = buildRequest(wire, ir);
-  const target = ir.stream ? streamUrl(wire, base, model) : outboundUrl(wire, base, model);
-
-  let upstream;
-  try {
-    upstream = await fetch(target, {
-      method: "POST",
-      headers: upstreamHeaders(wire, key),
-      body: JSON.stringify(outBody),
-    });
-  } catch (e) {
-    state.counters.fail += 1;
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, 502, `连不上上游：${e.message}`)));
-    logLine(state, { inbound, provider, wire, model, status: 502, ms: Date.now() - started });
-    return;
-  }
-
-  if (!upstream.ok) {
-    const text = await upstream.text().catch(() => "");
-    let msg = text;
-    try { const j = JSON.parse(text); msg = j.error?.message || j.error?.msg || j.message || text; } catch { /* keep raw */ }
-    state.counters.fail += 1;
-    res.writeHead(upstream.status, { "content-type": "application/json" });
-    res.end(JSON.stringify(errorBody(inbound, upstream.status, String(msg).slice(0, 800))));
-    logLine(state, { inbound, provider, wire, model, status: upstream.status, ms: Date.now() - started });
-    return;
-  }
-
-  const em = createEmitter(inbound, { model });
-
-  if (!ir.stream) {
-    let json = null;
-    try {
-      if (String(upstream.headers.get("content-type") || "").includes("event-stream")) {
-        // 上游硬要流式：先聚合
-        for await (const ev of decodeStream(wire, upstream)) em.push(ev);
-        json = em.toJSON();
-      } else {
-        json = await upstream.json();
-      }
-    } catch (e) {
-      state.counters.fail += 1;
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify(errorBody(inbound, 502, `上游响应解析失败：${e.message}`)));
-      return;
-    }
-    if (String(upstream.headers.get("content-type") || "").includes("event-stream")) {
-      // 已聚合完毕
-    } else {
-      for (const ev of decodeJSON(wire, json)) em.push(ev);
-      json = em.toJSON();
-    }
-    state.counters.ok += 1;
-    state.counters.inTok += json?.usage?.input_tokens || json?.usage?.prompt_tokens || json?.usageMetadata?.promptTokenCount || 0;
-    state.counters.outTok += json?.usage?.output_tokens || json?.usage?.completion_tokens || json?.usageMetadata?.candidatesTokenCount || 0;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(json));
-    logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage: json?.usage || json?.usageMetadata });
-    return;
-  }
-
-  // ---- 流式 ----
-  res.writeHead(200, sseHeaders);
-  let usage = null;
-  try {
-    for await (const ev of decodeStream(wire, upstream)) {
-      if (ev.type === "usage") usage = { input: ev.input, output: ev.output };
-      const chunk = em.push(ev);
-      if (chunk) res.write(chunk);
-    }
-    const tail = em.end();
-    if (tail) res.write(tail);
-  } catch (e) {
-    try { res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`); } catch { /* gone */ }
-  } finally {
-    try { res.end(); } catch { /* gone */ }
-    state.counters.ok += 1;
-    if (usage) { state.counters.inTok += usage.input || 0; state.counters.outTok += usage.output || 0; }
-    logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage });
-  }
-}
-
-function listModels(state) {
-  const data = [];
-  const push = (p, list) => {
-    for (const m of list) {
-      data.push({
-        id: state.prefix ? `${p.id}/${m}` : m,
-        object: "model",
-        created: 0,
-        owned_by: p.id,
-      });
-    }
+// ---------------- 出站构造 ----------------
+t("openai: 一条 user 里的 text+tool_result 拆成 tool 消息在前", () => {
+  const ir = {
+    model: "m", system: "S", messages: [
+      { role: "assistant", blocks: [{ type: "tool_use", id: "c1", name: "f", input: { a: 1 } }] },
+      { role: "user", blocks: [{ type: "text", text: "继续" }, { type: "tool_result", toolUseId: "c1", text: "结果" }] },
+    ],
+    tools: [], toolChoice: null, maxTokens: 10, temperature: null, topP: null, stop: [], stream: true,
   };
-  const providers = state.provider ? [state.provider] : providerList();
-  for (const p of providers) {
-    const pool = modelPool(p).filter(isChatModel);
-    if (pool.length) push(p, pool);
-  }
-  return data;
-}
+  const b = buildRequest("openai", ir);
+  assert.equal(b.messages[0].role, "system");
+  assert.equal(b.messages[2].role, "tool");
+  assert.equal(b.messages[2].tool_call_id, "c1");
+  assert.equal(b.messages[3].role, "user");
+  assert.equal(b.messages[3].content, "继续");
+  assert.equal(b.stream_options.include_usage, true);
+});
 
-function logLine(state, info) {
-  if (!state.log) return;
-  const t = new Date().toTimeString().slice(0, 8);
-  const ms = `${info.ms}ms`;
-  const st = info.status >= 400 ? c.red(String(info.status)) : c.green(String(info.status));
-  const usage = info.usage
-    ? ` ${c.gray("↑" + (info.usage.input ?? info.usage.input_tokens ?? info.usage.promptTokenCount ?? 0) + " ↓" + (info.usage.output ?? info.usage.output_tokens ?? info.usage.candidatesTokenCount ?? 0))}`
-    : "";
-  console.log(
-    `${c.gray(t)}  ${c.cyan(pad(info.inbound, 9))} ${c.gray("→")} ${c.yellow(pad(info.provider.id, 6))}`
-    + ` ${c.gray(pad(`[${info.wire}]`, 11))} ${c.white(pad(info.model, 26))} ${st} ${c.gray(ms)}${usage}`,
-  );
-}
+t("anthropic: max_tokens 缺省补 8192，tool_choice 映射", () => {
+  const ir = {
+    model: "m", system: "", messages: [{ role: "user", blocks: [{ type: "text", text: "hi" }] }],
+    tools: [{ name: "f", description: "", schema: {} }], toolChoice: { name: "f" },
+    maxTokens: null, temperature: null, topP: null, stop: [], stream: false,
+  };
+  const b = buildRequest("anthropic", ir);
+  assert.equal(b.max_tokens, 8192);
+  assert.deepEqual(b.tool_choice, { type: "tool", name: "f" });
+});
 
-export function startServer(opts = {}) {
-  const { server, state } = createServer(opts);
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(state.port, state.host, () => {
-      resolve({ server, state });
-    });
+t("gemini: tool_result 用 name 回填 functionResponse", () => {
+  const ir = {
+    model: "m", system: "", messages: [
+      { role: "assistant", blocks: [{ type: "tool_use", id: "x1", name: "get_weather", input: {} }] },
+      { role: "user", blocks: [{ type: "tool_result", toolUseId: "x1", text: "晴" }] },
+    ],
+    tools: [], toolChoice: null, maxTokens: null, temperature: null, topP: null, stop: [], stream: false,
+  };
+  const b = buildRequest("gemini", ir);
+  const fr = b.contents.find((c) => c.parts.some((p) => p.functionResponse));
+  assert.equal(fr.parts[0].functionResponse.name, "get_weather");
+  assert.equal(fr.parts[0].functionResponse.response.result, "晴");
+});
+
+t("gemini: 剔除 schema 里不认的字段", () => {
+  const ir = {
+    model: "m", system: "", messages: [{ role: "user", blocks: [{ type: "text", text: "x" }] }],
+    tools: [{ name: "f", description: "", schema: { type: "object", $schema: "x", properties: { a: { type: "string" } } } }],
+    toolChoice: null, maxTokens: null, temperature: null, topP: null, stop: [], stream: false,
+  };
+  const b = buildRequest("gemini", ir);
+  const decl = b.tools[0].functionDeclarations[0];
+  assert.equal(decl.parameters.$schema, undefined);
+  assert.equal(decl.parameters.properties.a.type, "string");
+});
+
+// ---------------- 4×4 往返 ----------------
+const canonical = {
+  model: "test-model",
+  system: "你是测试助手",
+  max_tokens: 256,
+  temperature: 0.2,
+  stream: false,
+  tools: [{ name: "get_weather", description: "查天气", input_schema: { type: "object", properties: { city: { type: "string" } } } }],
+  messages: [
+    { role: "user", content: "北京天气" },
+    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "get_weather", input: { city: "北京" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "晴 18 度" }] },
+    { role: "assistant", content: "北京晴，18 度。" },
+  ],
+};
+
+for (const target of ["anthropic", "openai", "responses", "gemini"]) {
+  t(`往返 anthropic → ${target} → IR`, () => {
+    const ir1 = parseRequest("anthropic", canonical);
+    const body = buildRequest(target, ir1);
+    const ir2 = parseRequest(target, body);
+    assert.equal(ir2.system, "你是测试助手");
+    assert.equal(ir2.tools.length, 1);
+    assert.equal(ir2.tools[0].name, "get_weather");
+    const use = ir2.messages.flatMap((m) => m.blocks).find((b) => b.type === "tool_use");
+    const res = ir2.messages.flatMap((m) => m.blocks).find((b) => b.type === "tool_result");
+    assert.ok(use, "tool_use 丢了");
+    assert.equal(use.name, "get_weather");
+    assert.equal(use.input.city, "北京");
+    assert.ok(res, "tool_result 丢了");
+    assert.equal(res.text, "晴 18 度");
+    const texts = ir2.messages.filter((m) => m.role === "assistant").flatMap((m) => m.blocks).filter((b) => b.type === "text");
+    assert.ok(texts.some((b) => b.text.includes("18")));
   });
 }
+
+// ---------------- 事件编码 ----------------
+const events = [
+  { type: "start" },
+  { type: "usage", input: 12, output: 0 },
+  { type: "text", text: "你好" },
+  { type: "tool_start", slot: 0, id: "c1", name: "get_weather" },
+  { type: "tool_args", slot: 0, partial: '{"city":' },
+  { type: "tool_args", slot: 0, partial: '"北京"}' },
+  { type: "usage", input: 12, output: 30 },
+  { type: "finish", reason: "tool_use" },
+];
+
+t("emit anthropic: 事件流结构完整", () => {
+  const em = createEmitter("anthropic", { model: "m" });
+  let s = "";
+  for (const e of events) s += em.push(e);
+  s += em.end();
+  assert.ok(s.includes("event: message_start"));
+  assert.ok(s.includes('"type":"text_delta","text":"你好"'));
+  assert.ok(s.includes('"type":"tool_use"'));
+  assert.ok(s.includes('"stop_reason":"tool_use"'));
+  assert.ok(s.includes("event: message_stop"));
+  const j = em.toJSON();
+  assert.equal(j.content[0].text, "你好");
+  assert.deepEqual(j.content[1].input, { city: "北京" });
+  assert.equal(j.stop_reason, "tool_use");
+});
+
+t("emit openai: 分片参数原样转发，最后带 usage 与 DONE", () => {
+  const em = createEmitter("openai", { model: "m" });
+  let s = "";
+  for (const e of events) s += em.push(e);
+  s += em.end();
+  assert.ok(s.includes('"tool_calls"'));
+  assert.ok(s.includes('{\\"city\\":'));
+  assert.ok(s.includes("data: [DONE]"));
+  const j = em.toJSON();
+  assert.equal(j.choices[0].message.content, "你好");
+  assert.equal(j.choices[0].message.tool_calls[0].function.name, "get_weather");
+  assert.deepEqual(JSON.parse(j.choices[0].message.tool_calls[0].function.arguments), { city: "北京" });
+  assert.equal(j.choices[0].finish_reason, "tool_calls");
+});
+
+t("emit responses: 事件名齐全，output 结构可用", () => {
+  const em = createEmitter("responses", { model: "m" });
+  let s = "";
+  for (const e of events) s += em.push(e);
+  s += em.end();
+  assert.ok(s.includes("event: response.output_text.delta"));
+  assert.ok(s.includes("event: response.function_call_arguments.delta"));
+  assert.ok(s.includes("event: response.completed"));
+  const j = em.toJSON();
+  const fc = j.output.find((o) => o.type === "function_call");
+  assert.equal(fc.name, "get_weather");
+  assert.deepEqual(JSON.parse(fc.arguments), { city: "北京" });
+  assert.equal(j.usage.input_tokens, 12);
+});
+
+t("emit gemini: functionCall 完整参数 + finishReason", () => {
+  const em = createEmitter("gemini", { model: "m" });
+  let s = "";
+  for (const e of events) s += em.push(e);
+  s += em.end();
+  assert.ok(s.includes('"finishReason":"STOP"'));
+  const j = em.toJSON();
+  const fc = j.candidates[0].content.parts.find((p) => p.functionCall);
+  assert.deepEqual(fc.functionCall.args, { city: "北京" });
+  assert.equal(j.usageMetadata.promptTokenCount, 12);
+});
+
+// ---------------- 上游 JSON 解码 ----------------
+t("decodeJSON: 四种上游格式都能还原成事件", () => {
+  const cases = {
+    anthropic: { content: [{ type: "text", text: "hi" }], stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 2 } },
+    openai: { choices: [{ message: { content: "hi" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 2 } },
+    responses: { output: [{ type: "message", content: [{ type: "output_text", text: "hi" }] }], usage: { input_tokens: 5, output_tokens: 2 } },
+    gemini: { candidates: [{ content: { parts: [{ text: "hi" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 } },
+  };
+  for (const [proto, json] of Object.entries(cases)) {
+    const evs = [...decodeJSON(proto, json)];
+    assert.ok(evs.some((e) => e.type === "text" && e.text === "hi"), `${proto} 没解析出文本`);
+    assert.ok(evs.some((e) => e.type === "finish"), `${proto} 没解析出结束`);
+    const u = evs.find((e) => e.type === "usage");
+    assert.ok(u && u.input === 5, `${proto} usage 不对`);
+  }
+});
+
+// ---------------- URL 拼接 ----------------
+t("URL: 带版本号不重复补，Gemini 走 v1beta + alt=sse", () => {
+  assert.equal(outboundUrl("anthropic", "https://x.com", "m"), "https://x.com/v1/messages");
+  assert.equal(outboundUrl("anthropic", "https://x.com/v1", "m"), "https://x.com/v1/messages");
+  assert.equal(outboundUrl("openai", "https://x.com/v1", "m"), "https://x.com/v1/chat/completions");
+  assert.equal(outboundUrl("openai", "https://x.com", "m"), "https://x.com/v1/chat/completions");
+  assert.equal(outboundUrl("gemini", "https://x.com", "gemini-2.0"), "https://x.com/v1beta/models/gemini-2.0:generateContent");
+  assert.equal(streamUrl("gemini", "https://x.com", "g"), "https://x.com/v1beta/models/g:streamGenerateContent?alt=sse");
+});
+
+console.log("");
+console.log(`  ${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);
+
+"""}]}  
+{
