@@ -122,9 +122,9 @@ Built-in channels: `ms` ModelScope, `ds` DeepSeek, `glm` Zhipu, `kimi` Moonshot,
 ## Dev
 
 ```bash
-npm test             # 31 cases in two suites
+npm test             # 32 cases in two suites
 node test/run.mjs    # 18 offline cases: parse / build / 4×4 round-trip / event encoding
-node test/serve.mjs  # 13 server cases: auth / body limit / concurrency / timeout / stream errors / config guard
+node test/serve.mjs  # 14 server cases: auth / body limit / concurrency / timeout / disconnect / stream errors / config guard
 ```
 
 MIT License.

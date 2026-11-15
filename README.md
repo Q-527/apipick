@@ -227,9 +227,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
 ## 开发
 
 ```bash
-npm test              # 两组共 31 个用例
+npm test              # 两组共 32 个用例
 node test/run.mjs     # 18 个离线用例：解析 / 构造 / 4×4 往返 / 事件编码
-node test/serve.mjs   # 13 个服务层用例：认证 / 体积上限 / 并发 / 超时 / 流式失败 / 配置保护
+node test/serve.mjs   # 14 个服务层用例：认证 / 体积上限 / 并发 / 超时 / 断连 / 流式失败 / 配置保护
 node bin/api.mjs --help
 ```
 

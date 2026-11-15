@@ -30,6 +30,7 @@ const t = async (name, fn) => {
 // ---------------- 假上游 ----------------
 const seen = [];
 const upstream = http.createServer(async (req, res) => {
+  res.on("error", () => { /* 客户端提前断开是预期 */ });
   let body = "";
   for await (const ch of req) body += ch;
   let parsed = {};
@@ -222,6 +223,27 @@ await t("上游 5xx 原样透传状态并计失败", async () => {
     assert.equal(r.status, 500, `应透传 500，实际 ${r.status}`);
     assert.equal(s.state.counters.fail, 1);
     assert.equal(s.state.counters.ok, 0);
+  } finally { await s.close(); }
+});
+
+await t("客户端断开时取消上游请求并记失败", async () => {
+  const s = await boot();
+  try {
+    const payload = JSON.stringify(msg("slow-model"));
+    const req = http.request({
+      hostname: "127.0.0.1",
+      port: s.port,
+      path: "/v1/messages",
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+    });
+    req.on("error", () => { /* 自己掐的，忽略 */ });
+    req.write(payload);
+    await new Promise((r) => setTimeout(r, 150));
+    req.destroy();
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(s.state.counters.fail, 1, "断连应记为失败");
+    assert.equal(s.state.counters.ok, 0, "断连不该记为成功");
   } finally { await s.close(); }
 });
 
