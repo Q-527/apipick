@@ -1,0 +1,358 @@
+// index.mjs — `apipick serve`：本地网关，把入站协议翻译成渠道真正说的协议。
+import http from "node:http";
+import { resolveProvider, providerList, getKey, getLast, getCurrent, modelPool, isChatModel } from "../core.mjs";
+import { endpointFor } from "../targets.mjs";
+import { parseRequest } from "./parse.mjs";
+import { buildRequest, outboundUrl, streamUrl } from "./build.mjs";
+import { decodeStream, decodeJSON } from "./stream.mjs";
+import { createEmitter } from "./emit.mjs";
+import { roughTokens } from "./ir.mjs";
+import { c, pad } from "../ui.mjs";
+
+const DEFAULT_PORT = 8787;
+
+// ---------------- 渠道 / 协议选择 ----------------
+function looksAnthropic(base) {
+  return /anthropic|\/apps\/?$/i.test(String(base || ""));
+}
+
+export function pickWire(inbound, provider, forced) {
+  if (forced) return forced;
+  const declared = provider.protocols;
+  if (Array.isArray(declared) && declared.length) {
+    return declared.includes(inbound) ? inbound : declared[0];
+  }
+  if (inbound === "anthropic" && looksAnthropic(provider.baseUrl)) return "anthropic";
+  if (provider.endpoints?.openai) return "openai";
+  if (provider.endpoints?.gemini) return "gemini";
+  if (provider.baseUrl) return "anthropic";
+  return inbound;
+}
+
+function splitModel(name) {
+  const i = String(name || "").indexOf("/");
+  if (i > 0) {
+    const p = resolveProvider(name.slice(0, i));
+    if (p) return { provider: p, model: name.slice(i + 1) };
+  }
+  return { provider: null, model: String(name || "") };
+}
+
+function defaultProvider() {
+  const last = getLast();
+  if (last) {
+    const p = resolveProvider(last);
+    if (p) return p;
+  }
+  const withKey = providerList().filter((p) => getKey(p.id));
+  if (withKey.length) return withKey[0];
+  return providerList()[0] || null;
+}
+
+function upstreamHeaders(wire, key) {
+  if (wire === "anthropic") {
+    return { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key };
+  }
+  if (wire === "gemini") {
+    return { "content-type": "application/json", "x-goog-api-key": key };
+  }
+  return { "content-type": "application/json", authorization: `Bearer ${key}` };
+}
+
+function errorBody(inbound, status, message) {
+  if (inbound === "anthropic") {
+    return { type: "error", error: { type: status === 429 ? "rate_limit_error" : "api_error", message } };
+  }
+  if (inbound === "gemini") return { error: { code: status, message, status: "ERROR" } };
+  return { error: { message, type: "upstream_error", code: status } };
+}
+
+async function readBody(req, limit = 64 * 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const ch of req) {
+    size += ch.length;
+    if (size > limit) throw new Error("请求体过大");
+    chunks.push(ch);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+const sseHeaders = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache, no-transform",
+  connection: "keep-alive",
+  "x-accel-buffering": "no",
+};
+
+// ---------------- server ----------------
+export function createServer(opts = {}) {
+  const state = {
+    port: opts.port || DEFAULT_PORT,
+    host: opts.host || "127.0.0.1",
+    provider: opts.provider ? resolveProvider(opts.provider) : null,
+    wire: opts.wire || "",
+    log: !!opts.log,
+    prefix: opts.prefix !== false,
+    token: opts.token || "",
+    counters: { req: 0, ok: 0, fail: 0, inTok: 0, outTok: 0 },
+  };
+  if (opts.provider && !state.provider) throw new Error(`未知渠道：${opts.provider}`);
+
+  const server = http.createServer((req, res) => {
+    handle(req, res, state).catch((e) => {
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: e.message || String(e) } }));
+      } catch { /* client gone */ }
+    });
+  });
+
+  return { server, state };
+}
+
+async function handle(req, res, state) {
+  const url = new URL(req.url, "http://localhost");
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "*",
+      "access-control-allow-methods": "GET,POST,OPTIONS",
+    });
+    res.end();
+    return;
+  }
+
+  if (path === "/" || path === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      service: "apipick serve",
+      provider: state.provider ? state.provider.id : "auto (model prefix or last used)",
+      wire: state.wire || "auto",
+      requests: state.counters.req,
+    }));
+    return;
+  }
+
+  // 只有显式 --token 时才校验；默认只监听 127.0.0.1，不给本机之外开门
+  if (state.token) {
+    const auth = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const got = auth || String(req.headers["x-api-key"] || "");
+    if (got !== state.token) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "token 不对", type: "auth_error" } }));
+      return;
+    }
+  }
+
+  if (path === "/v1/models" || path === "/models") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: listModels(state) }));
+    return;
+  }
+
+  // 兼容 Claude Code 的 token 计数端点（它只用来估上下文，不要求精确）
+  if (path === "/v1/messages/count_tokens") {
+    const raw = await readBody(req);
+    let body = {};
+    try { body = JSON.parse(raw); } catch { /* ignore */ }
+    const ir = parseRequest("anthropic", body);
+    let chars = ir.system.length;
+    for (const m of ir.messages) for (const b of m.blocks) chars += (b.text || "").length + 8;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ input_tokens: roughTokens("x".repeat(chars)) || 1 }));
+    return;
+  }
+
+  // 模型名允许带 %2F（ms/Qwen/xxx 这种带斜杠的写法）
+  const gm = /^\/(?:v1beta|v1)\/models\/(.+):(generateContent|streamGenerateContent)$/.exec(path);
+  let inbound = "";
+  let modelFromPath = "";
+  if (gm) { inbound = "gemini"; modelFromPath = decodeURIComponent(gm[1]); }
+  else if (path === "/v1/messages" || path === "/messages") inbound = "anthropic";
+  else if (path === "/v1/chat/completions" || path === "/chat/completions") inbound = "openai";
+  else if (path === "/v1/responses" || path === "/responses") inbound = "responses";
+
+  if (!inbound) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `没有这个路径：${path}` } }));
+    return;
+  }
+  if (req.method !== "POST") {
+    res.writeHead(405, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "只接受 POST" } }));
+    return;
+  }
+
+  const started = Date.now();
+  state.counters.req += 1;
+
+  let ir;
+  try {
+    const raw = await readBody(req);
+    const body = JSON.parse(raw || "{}");
+    ir = parseRequest(inbound, body, { model: modelFromPath });
+  } catch (e) {
+    state.counters.fail += 1;
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inbound, 400, `请求体解析失败：${e.message}`)));
+    return;
+  }
+
+  // Gemini 的流式由路径决定
+  if (inbound === "gemini") ir.stream = gm[2] === "streamGenerateContent" || !!ir.stream;
+
+  // ---- 选渠道 ----
+  let provider = state.provider;
+  let model = ir.model;
+  if (!provider && state.prefix) {
+    const s = splitModel(ir.model);
+    if (s.provider) { provider = s.provider; model = s.model; }
+  }
+  if (!provider) provider = defaultProvider();
+  if (!provider) {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inbound, 503, "没有可用渠道，先跑 apipick add 加一个")));
+    return;
+  }
+  if (!model) model = getCurrent(provider.id) || (provider.known && provider.known[0]) || "";
+
+  const wire = pickWire(inbound, provider, state.wire);
+  const key = getKey(provider.id) || (provider.id === "ol" ? "ollama" : "");
+  const base = endpointFor(provider, wire, { local: provider.id === "ol" });
+  if (!base) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inbound, 502, `渠道 ${provider.id} 没有 ${wire} 协议的端点，用 --wire 指定`)));
+    return;
+  }
+
+  ir.model = model;
+  const outBody = buildRequest(wire, ir);
+  const target = ir.stream ? streamUrl(wire, base, model) : outboundUrl(wire, base, model);
+
+  let upstream;
+  try {
+    upstream = await fetch(target, {
+      method: "POST",
+      headers: upstreamHeaders(wire, key),
+      body: JSON.stringify(outBody),
+    });
+  } catch (e) {
+    state.counters.fail += 1;
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inbound, 502, `连不上上游：${e.message}`)));
+    logLine(state, { inbound, provider, wire, model, status: 502, ms: Date.now() - started });
+    return;
+  }
+
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => "");
+    let msg = text;
+    try { const j = JSON.parse(text); msg = j.error?.message || j.error?.msg || j.message || text; } catch { /* keep raw */ }
+    state.counters.fail += 1;
+    res.writeHead(upstream.status, { "content-type": "application/json" });
+    res.end(JSON.stringify(errorBody(inbound, upstream.status, String(msg).slice(0, 800))));
+    logLine(state, { inbound, provider, wire, model, status: upstream.status, ms: Date.now() - started });
+    return;
+  }
+
+  const em = createEmitter(inbound, { model });
+
+  if (!ir.stream) {
+    let json = null;
+    try {
+      if (String(upstream.headers.get("content-type") || "").includes("event-stream")) {
+        // 上游硬要流式：先聚合
+        for await (const ev of decodeStream(wire, upstream)) em.push(ev);
+        json = em.toJSON();
+      } else {
+        json = await upstream.json();
+      }
+    } catch (e) {
+      state.counters.fail += 1;
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify(errorBody(inbound, 502, `上游响应解析失败：${e.message}`)));
+      return;
+    }
+    if (String(upstream.headers.get("content-type") || "").includes("event-stream")) {
+      // 已聚合完毕
+    } else {
+      for (const ev of decodeJSON(wire, json)) em.push(ev);
+      json = em.toJSON();
+    }
+    state.counters.ok += 1;
+    state.counters.inTok += json?.usage?.input_tokens || json?.usage?.prompt_tokens || json?.usageMetadata?.promptTokenCount || 0;
+    state.counters.outTok += json?.usage?.output_tokens || json?.usage?.completion_tokens || json?.usageMetadata?.candidatesTokenCount || 0;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(json));
+    logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage: json?.usage || json?.usageMetadata });
+    return;
+  }
+
+  // ---- 流式 ----
+  res.writeHead(200, sseHeaders);
+  let usage = null;
+  try {
+    for await (const ev of decodeStream(wire, upstream)) {
+      if (ev.type === "usage") usage = { input: ev.input, output: ev.output };
+      const chunk = em.push(ev);
+      if (chunk) res.write(chunk);
+    }
+    const tail = em.end();
+    if (tail) res.write(tail);
+  } catch (e) {
+    try { res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`); } catch { /* gone */ }
+  } finally {
+    try { res.end(); } catch { /* gone */ }
+    state.counters.ok += 1;
+    if (usage) { state.counters.inTok += usage.input || 0; state.counters.outTok += usage.output || 0; }
+    logLine(state, { inbound, provider, wire, model, status: 200, ms: Date.now() - started, usage });
+  }
+}
+
+function listModels(state) {
+  const data = [];
+  const push = (p, list) => {
+    for (const m of list) {
+      data.push({
+        id: state.prefix ? `${p.id}/${m}` : m,
+        object: "model",
+        created: 0,
+        owned_by: p.id,
+      });
+    }
+  };
+  const providers = state.provider ? [state.provider] : providerList();
+  for (const p of providers) {
+    const pool = modelPool(p).filter(isChatModel);
+    if (pool.length) push(p, pool);
+  }
+  return data;
+}
+
+function logLine(state, info) {
+  if (!state.log) return;
+  const t = new Date().toTimeString().slice(0, 8);
+  const ms = `${info.ms}ms`;
+  const st = info.status >= 400 ? c.red(String(info.status)) : c.green(String(info.status));
+  const usage = info.usage
+    ? ` ${c.gray("↑" + (info.usage.input ?? info.usage.input_tokens ?? info.usage.promptTokenCount ?? 0) + " ↓" + (info.usage.output ?? info.usage.output_tokens ?? info.usage.candidatesTokenCount ?? 0))}`
+    : "";
+  console.log(
+    `${c.gray(t)}  ${c.cyan(pad(info.inbound, 9))} ${c.gray("→")} ${c.yellow(pad(info.provider.id, 6))}`
+    + ` ${c.gray(pad(`[${info.wire}]`, 11))} ${c.white(pad(info.model, 26))} ${st} ${c.gray(ms)}${usage}`,
+  );
+}
+
+export function startServer(opts = {}) {
+  const { server, state } = createServer(opts);
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(state.port, state.host, () => {
+      resolve({ server, state });
+    });
+  });
+}
