@@ -1,0 +1,19 @@
+# 运行时密钥与状态（默认在 ~/.apipick，此处兜底）
+keys.json
+state.json
+
+# 依赖与系统文件
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+
+# 本地密钥
+.env
+.env.*
+*.pem
+*.key
+
+# 生成的报告与截图
+api-report-*.html
+*.shot.png
