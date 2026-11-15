@@ -79,7 +79,6 @@ export function deleteCustomProvider(id) {
   if (!all[id]) return false;
   delete all[id];
   saveCustomProviders(all);
-  // drop cached models + key
   const cache = loadModelCache();
   if (cache[id]) { delete cache[id]; saveModelCache(cache); }
   const keys = loadKeys();
@@ -95,70 +94,34 @@ export function saveKeys(obj) {
   try { chmodSync(keysPath(), 0o600); } catch { /* windows no-op */ }
 }
 export function getKey(id) { return loadKeys()[id] || ""; }
-export function setKey(id, value) {
-  const k = loadKeys();
-  k[id] = value;
-  saveKeys(k);
-}
+export function setKey(id, value) { const k = loadKeys(); k[id] = value; saveKeys(k); }
 export function hasKey(id) { return !!getKey(id); }
 
 // ---------- state ----------
-export function loadState() {
-  return readJson(statePath(), { current: {} }) || { current: {} };
-}
-export function saveState(obj) {
-  ensureHome();
-  writeFileSync(statePath(), JSON.stringify(obj, null, 2));
-}
-export function getCurrent(id) {
-  const s = loadState();
-  return (s.current && s.current[id]) || "";
-}
-export function setCurrent(id, model) {
-  const s = loadState();
-  if (!s.current) s.current = {};
-  s.current[id] = model;
-  s.lastProvider = id;
-  saveState(s);
-}
+export function loadState() { return readJson(statePath(), { current: {} }) || { current: {} }; }
+export function saveState(obj) { ensureHome(); writeFileSync(statePath(), JSON.stringify(obj, null, 2)); }
+export function getCurrent(id) { const s = loadState(); return (s.current && s.current[id]) || ""; }
+export function setCurrent(id, model) { const s = loadState(); if (!s.current) s.current = {}; s.current[id] = model; s.lastProvider = id; saveState(s); }
 export function getLast() { return loadState().lastProvider || ""; }
-export function setLast(id) {
-  const s = loadState();
-  s.lastProvider = id;
-  saveState(s);
-}
-
-/** 默认目标 CLI（claude / qwen / codex / gemini / aider / opencode） */
+export function setLast(id) { const s = loadState(); s.lastProvider = id; saveState(s); }
 export function getTarget() { return loadState().target || "claude"; }
-export function setTarget(id) {
-  const s = loadState();
-  s.target = id;
-  saveState(s);
-}
+export function setTarget(id) { const s = loadState(); s.target = id; saveState(s); }
 
 // ---------- project config ----------
-export function projectConfigPath(cwd = process.cwd()) {
-  return join(cwd, ".apipick.json");
-}
-
+export function projectConfigPath(cwd = process.cwd()) { return join(cwd, ".apipick.json"); }
 export function loadProjectConfig(cwd = process.cwd()) {
   const fp = projectConfigPath(cwd);
   if (!existsSync(fp)) return null;
   try {
     const obj = JSON.parse(readFileSync(fp, "utf8"));
     return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
 export function saveProjectConfig(config, cwd = process.cwd()) {
   const fp = projectConfigPath(cwd);
   writeFileSync(fp, JSON.stringify({ ...(config || {}), updatedAt: new Date().toISOString() }, null, 2) + "\n");
   return fp;
 }
-
-/** The nearest ancestor project config wins; global state remains the fallback. */
 export function resolveProjectConfig(cwd = process.cwd()) {
   let cur = cwd;
   while (true) {
@@ -169,42 +132,31 @@ export function resolveProjectConfig(cwd = process.cwd()) {
     cur = parent;
   }
 }
-
 export function getProjectDefaults(cwd = process.cwd()) {
   const cfg = resolveProjectConfig(cwd) || {};
-  return {
-    provider: cfg.provider || "",
-    model: cfg.model || "",
-    target: cfg.target || getTarget(),
-  };
+  return { provider: cfg.provider || "", model: cfg.model || "", target: cfg.target || getTarget() };
 }
 
 // ---------- model capabilities ----------
-const DEFAULT_CAPABILITY = { tools: false, vision: false, stream: true, reasoning: false, context: 128000 };
-
-/**
- * Conservative name-based hints only. Providers can override these in
- * providers.json under modelCapabilities[modelId]. Unknown capabilities are
- * not advertised as supported.
- */
 export function getModelCapability(model, provider = null) {
-  const id = String(model || "");
-  const overrides = provider?.modelCapabilities || {};
-  const explicit = overrides[id];
+  const name = String(model || "").toLowerCase();
+  const defaults = { tools: false, vision: false, stream: true, reasoning: false, context: 128000 };
+  const overrides = provider && provider.modelCapabilities ? provider.modelCapabilities : {};
+  const explicit = overrides[String(model || "")] || overrides[name] || null;
   if (explicit && typeof explicit === "object") {
-    return { ...DEFAULT_CAPABILITY, ...explicit, context: Number(explicit.context || DEFAULT_CAPABILITY.context) };
+    return { ...defaults, ...explicit, context: Number(explicit.context || defaults.context) };
   }
-  const name = id.toLowerCase();
-  const vision = /vision|\bvl\b|gemini|gpt-4o|gpt-4\.1|claude-3|claude-sonnet|pixtral/i.test(name);
-  const reasoning = /reason|think|\br[1-9]\b|^o[1-9]|gemini-2\.5/i.test(name);
-  const tools = /gpt|claude|qwen|deepseek|glm|kimi|gemini|command-r/i.test(name);
-  return {
-    tools,
-    vision,
+  const cap = {
+    tools: /gpt|claude|qwen|deepseek|glm|kimi|gemini|command-r|sonnet|o1|o3|mistral|llama/i.test(name),
+    vision: /vision|vl|gemini|gpt-4o|gpt-4\.1|claude-3|sonnet|pixtral/i.test(name),
     stream: true,
-    reasoning,
-    context: ctxLimit(id, provider),
+    reasoning: /reason|think|r1|o1|o3|gemini-2\.5|deepseek-r1|claude-3\.7|claude-3\.5/i.test(name),
+    context: 128000,
   };
+  if (/gpt-4\.1|gemini-2\.5|claude-3\.7|claude-3\.5/i.test(name)) cap.context = 1000000;
+  else if (/qwen|deepseek|glm|kimi/i.test(name)) cap.context = 131072;
+  else if (/gpt-4o|gpt-4o-mini/i.test(name)) cap.context = 128000;
+  return cap;
 }
 
 export function filterModelsByCapability(models = [], filters = {}, provider = null) {
@@ -342,22 +294,10 @@ export function modelPool(provider, remote = []) {
 
 // ---------- model cache ----------
 export function loadModelCache() { return readJson(cachePath(), {}); }
-function saveModelCache(obj) {
-  ensureHome();
-  writeFileSync(cachePath(), JSON.stringify(obj, null, 2));
-}
-export function getCachedModels(id) {
-  const e = loadModelCache()[id];
-  return (e && e.models) || [];
-}
-export function setCachedModels(id, models, endpoint) {
-  const c = loadModelCache();
-  c[id] = { endpoint: endpoint || "", at: new Date().toISOString(), models };
-  saveModelCache(c);
-}
-export function cacheInfo(id) {
-  return loadModelCache()[id] || null;
-}
+function saveModelCache(obj) { ensureHome(); writeFileSync(cachePath(), JSON.stringify(obj, null, 2)); }
+export function getCachedModels(id) { const e = loadModelCache()[id]; return (e && e.models) || []; }
+export function setCachedModels(id, models, endpoint) { const c = loadModelCache(); c[id] = { endpoint: endpoint || "", at: new Date().toISOString(), models }; saveModelCache(c); }
+export function cacheInfo(id) { return loadModelCache()[id] || null; }
 
 // ---------- endpoint guessing ----------
 /** turn a base URL into a list of likely /models endpoints, best guess first */
@@ -368,17 +308,10 @@ export function guessModelEndpoints(baseUrl) {
     const u = new URL(baseUrl);
     const origin = u.origin;
     let p = (u.pathname || "").replace(/\/+$/, "");
-    // strip vendor-specific anthropic suffixes to reach the api root
     p = p.replace(/\/anthropic$/i, "").replace(/\/apps$/i, "");
-    if (/\/v\d+[a-z]*$/i.test(p)) {
-      push(`${origin}${p}/models`);           // already versioned: /v1 -> /v1/models
-    } else {
-      push(`${origin}${p}/v1/models`);
-      push(`${origin}${p}/models`);
-    }
-    push(`${origin}/v1/models`);
-    push(`${origin}/models`);
-    push(`${origin}/api/tags`);               // ollama style
+    if (/\/v\d+[a-z]*$/i.test(p)) push(`${origin}${p}/models`);
+    else { push(`${origin}${p}/v1/models`); push(`${origin}${p}/models`); }
+    push(`${origin}/v1/models`); push(`${origin}/models`); push(`${origin}/api/tags`);
   } catch { /* bad url -> no guess */ }
   return out;
 }
@@ -388,7 +321,7 @@ function pickModelIds(json) {
   if (Array.isArray(json)) return json.map((x) => (typeof x === "string" ? x : x && (x.id || x.name || x.model)));
   const arr = json.data || json.models || json.result || json.list || [];
   if (Array.isArray(arr)) return arr.map((x) => (typeof x === "string" ? x : x && (x.id || x.name || x.model)));
-  if (arr && typeof arr === "object") return Object.keys(arr); // {models:{...}}
+  if (arr && typeof arr === "object") return Object.keys(arr);
   return [];
 }
 
@@ -408,11 +341,6 @@ async function tryFetch(url, headers, timeoutMs) {
   }
 }
 
-/**
- * Probe a provider's model list. Tries the explicit endpoint first, then guesses.
- * Handles OpenAI (`data[].id`), Anthropic, and Ollama (`models[].name`) shapes.
- * Returns { models, endpoint, error }.
- */
 export async function probeModels({ baseUrl, modelsEndpoint, key, timeoutMs = 8000, budgetMs = 15000 }) {
   const cands = [];
   if (modelsEndpoint) cands.push(modelsEndpoint);
@@ -428,7 +356,6 @@ export async function probeModels({ baseUrl, modelsEndpoint, key, timeoutMs = 80
     const headers = { "User-Agent": "claude-api", Accept: "application/json" };
     if (key) headers["Authorization"] = `Bearer ${key}`;
     let r = await tryFetch(url, headers, per);
-    // some gateways only accept anthropic-style auth
     if (!r.ok && key && (r.status === 401 || r.status === 403 || r.status === 400)) {
       const left2 = budgetMs - (Date.now() - started);
       if (left2 > 1200) {
@@ -447,11 +374,8 @@ export async function probeModels({ baseUrl, modelsEndpoint, key, timeoutMs = 80
   return { models: [], endpoint: "", error: lastErr || "全部候选端点都失败" };
 }
 
-/** convenience: probe + persist to cache */
 export async function scanAndCache(provider, key, timeoutMs) {
-  const r = await probeModels({
-    baseUrl: provider.baseUrl, modelsEndpoint: provider.modelsEndpoint, key, timeoutMs,
-  });
+  const r = await probeModels({ baseUrl: provider.baseUrl, modelsEndpoint: provider.modelsEndpoint, key, timeoutMs });
   if (r.models.length) setCachedModels(provider.id, r.models, r.endpoint);
   return r;
 }
